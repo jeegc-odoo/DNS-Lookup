@@ -14,3 +14,5 @@ You can contribute to improve the app by adding features, killing bugs, making t
 * The information must never be diverted to other places rather than just the target servers and DNS lookup services.
 * A technical document must be included explaining the code.
 * Of course this is made with AI and of course you can use AI to modify it. Of course you must check what it did.
+## What to download?
+For mac users, download the app folder or the zip with Mac_desde_codigo
