@@ -1,0 +1,275 @@
+#!/bin/bash
+# =============================================================================
+#  Mail Diagnostics - launcher para macOS (Contents/MacOS/MailDiagnostics)
+#
+#  Se ejecuta con doble clic, sin Terminal.
+#  En el primer arranque (o si falta algo) revisa los componentes, muestra al
+#  usuario qué encontró y qué haría falta instalar, y NO descarga ni instala
+#  nada sin su permiso explícito.
+#
+#  Qué puede descargar (solo con permiso):
+#    - Python 3 oficial de python.org (se verifica la firma del instalador).
+#    - dnspython 2.7.0 de pypi.org (se verifica su huella SHA-256).
+#  No envía ningún dato del usuario a ningún lado.
+#
+#  Compatible con el bash 3.2 que trae macOS.
+# =============================================================================
+
+APP_NAME="Mail Diagnostics"
+APP_VERSION="2.2"
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+RES="$HERE/../Resources"
+APP_SCRIPT="$RES/mail_diagnostics.py"
+REQS="$RES/requirements.txt"
+DEP_NAME="dnspython"
+DEP_VERSION="2.7.0"
+
+SUPPORT="$HOME/Library/Application Support/$APP_NAME"
+VENV="$SUPPORT/venv"
+VPY="$VENV/bin/python3"
+STAMP="$SUPPORT/setup.ok"
+LOG_DIR="$HOME/Library/Logs/$APP_NAME"
+LOG="$LOG_DIR/launcher.log"
+REPORTS="$HOME/Documents/$APP_NAME"
+
+PY_FALLBACK_URL="https://www.python.org/ftp/python/3.13.1/python-3.13.1-macos11.pkg"
+
+# Las apps abiertas desde Finder heredan un PATH mínimo
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+mkdir -p "$SUPPORT" "$LOG_DIR" "$REPORTS"
+chmod 700 "$SUPPORT" "$LOG_DIR" 2>/dev/null
+exec 3>>"$LOG"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&3; }
+
+# ------------------------------------------------------------ Diálogos ------
+notify() {
+    osascript - "$1" "$APP_NAME" >/dev/null 2>&1 <<'EOF'
+on run argv
+    display notification (item 1 of argv) with title (item 2 of argv)
+end run
+EOF
+}
+
+# Pregunta con dos botones. Devuelve 0 solo si el usuario elige el botón de aceptar.
+ask() {
+    local r
+    r=$(osascript - "$1" "$2" "$APP_NAME" 2>/dev/null <<'EOF'
+on run argv
+    try
+        display dialog (item 1 of argv) with title (item 3 of argv) buttons {"Cancelar", (item 2 of argv)} default button 2 cancel button 1 with icon note
+        return "yes"
+    on error
+        return "no"
+    end try
+end run
+EOF
+)
+    [ "$r" = "yes" ]
+}
+
+info_box() {
+    osascript - "$1" "$APP_NAME" >/dev/null 2>&1 <<'EOF'
+on run argv
+    display dialog (item 1 of argv) with title (item 2 of argv) buttons {"OK"} default button 1 with icon note
+end run
+EOF
+}
+
+# Muestra un error, ofrece abrir el registro y termina.
+die() {
+    log "ERROR: $1"
+    local r
+    r=$(osascript - "$1" "$APP_NAME" 2>/dev/null <<'EOF'
+on run argv
+    try
+        set b to button returned of (display dialog (item 1 of argv) with title (item 2 of argv) buttons {"Ver registro", "Cerrar"} default button 2 with icon stop)
+        return b
+    on error
+        return "Cerrar"
+    end try
+end run
+EOF
+)
+    [ "$r" = "Ver registro" ] && open -e "$LOG"
+    rm -f "$LOCK"
+    exit 1
+}
+
+# ---------------------------------------------------- Una sola instancia ----
+LOCK="$SUPPORT/launcher.pid"
+if [ -f "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
+    log "Ya hay un launcher en ejecución; salgo."
+    notify "La aplicación ya se está preparando, espera un momento."
+    exit 0
+fi
+echo $$ >"$LOCK"
+trap 'rm -f "$LOCK"' EXIT
+
+log "===== Inicio v$APP_VERSION ====="
+
+[ -f "$APP_SCRIPT" ] && [ -f "$REQS" ] \
+    || die "Faltan archivos dentro de la aplicación. Descárgala de nuevo."
+
+# ---------------------------------------------------------- Revisión --------
+# Python válido: >= 3.9, con ssl y Tkinter 8.6+.
+# (El Python de Apple trae Tk 8.5, que en macOS recientes muestra ventanas en blanco.)
+python_ok() {
+    [ -x "$1" ] || return 1
+    "$1" -I -c 'import sys, ssl, tkinter
+sys.exit(0 if sys.version_info >= (3, 9) and tkinter.TkVersion >= 8.6 else 1)' >/dev/null 2>&1
+}
+
+find_python() {
+    local p
+    # python.org (de la versión más nueva a la más vieja)
+    for p in $(ls -d /Library/Frameworks/Python.framework/Versions/3.*/bin/python3 2>/dev/null \
+               | awk -F/ '{split($6,v,"."); printf "%05d %s\n", v[2], $0}' | sort -rn | cut -d' ' -f2-); do
+        python_ok "$p" && { echo "$p"; return 0; }
+    done
+    # Homebrew
+    for p in /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+        python_ok "$p" && { echo "$p"; return 0; }
+    done
+    # /usr/bin/python3 solo si las Command Line Tools ya están instaladas
+    # (si no, macOS abriría por su cuenta el instalador de Xcode)
+    if xcode-select -p >/dev/null 2>&1; then
+        python_ok /usr/bin/python3 && { echo /usr/bin/python3; return 0; }
+    fi
+    return 1
+}
+
+deps_ok() {
+    [ -x "$VPY" ] || return 1
+    [ "$(cat "$VENV/.base_python" 2>/dev/null)" = "$PY" ] || return 1
+    "$VPY" -I -c "import tkinter, dns.resolver, dns.version, sys
+sys.exit(0 if dns.version.version == '$DEP_VERSION' else 1)" >/dev/null 2>&1
+}
+
+PY="$(find_python)"
+NEED_PY=0; NEED_DEPS=0
+[ -n "$PY" ] || NEED_PY=1
+if [ $NEED_PY -eq 1 ] || ! deps_ok; then NEED_DEPS=1; fi
+FIRST_RUN=0
+[ "$(cat "$STAMP" 2>/dev/null)" = "$APP_VERSION" ] || FIRST_RUN=1
+log "Revisión: python='${PY:-ninguno}' need_py=$NEED_PY need_deps=$NEED_DEPS first_run=$FIRST_RUN"
+
+# ------------------------------------------------- Pedir permiso ------------
+if [ $NEED_PY -eq 1 ] || [ $NEED_DEPS -eq 1 ]; then
+    if [ $NEED_PY -eq 1 ]; then
+        PY_LINE="✗  Python 3 con soporte gráfico (Tk 8.6): no está instalado"
+    else
+        PY_LINE="✓  $("$PY" -V 2>&1) con Tk $("$PY" -I -c 'import tkinter; print(tkinter.TkVersion)' 2>/dev/null)"
+    fi
+    DEP_LINE="✗  $DEP_NAME $DEP_VERSION: falta"
+
+    ACTIONS=""
+    if [ $NEED_PY -eq 1 ]; then
+        ACTIONS="• Descargar la versión estable más reciente de Python 3 desde python.org (unos 70 MB), comprobar que el instalador esté firmado por la Python Software Foundation e instalarlo. macOS te pedirá tu contraseña de administrador.
+
+"
+    fi
+    ACTIONS="$ACTIONS• Descargar $DEP_NAME $DEP_VERSION desde pypi.org (unos 310 KB), comprobar su huella SHA-256 e instalarlo solo para esta app, en:
+   ~/Library/Application Support/$APP_NAME"
+
+    MSG="Revisión de componentes:
+
+$PY_LINE
+$DEP_LINE
+
+Para poder abrir la aplicación, con tu permiso se hará lo siguiente:
+
+$ACTIONS
+
+Solo se descargan esos archivos; no se envía ninguna información tuya. No se instala nada más ni se cambia ninguna configuración del sistema."
+
+    if ! ask "$MSG" "Permitir e instalar"; then
+        log "El usuario no dio permiso para instalar."
+        info_box "No se instaló nada.
+
+Cuando quieras usar la aplicación, vuelve a abrirla y elige \"Permitir e instalar\"."
+        exit 0
+    fi
+    log "El usuario dio permiso para instalar."
+fi
+
+# ------------------------------------------------------ Instalar Python ----
+install_python() {
+    notify "Descargando Python desde python.org..."
+    local tmp url
+    tmp="$(mktemp -d)"
+    url=$(curl -fsSL --proto '=https' --max-time 30 "https://www.python.org/downloads/macos/" 2>>"$LOG" \
+          | grep -oE 'https://www\.python\.org/ftp/python/3\.[0-9]+\.[0-9]+/python-3\.[0-9]+\.[0-9]+-macos11\.pkg' \
+          | head -1)
+    [ -n "$url" ] || url="$PY_FALLBACK_URL"
+    log "Descargando $url"
+    curl -fL --proto '=https' --retry 2 --max-time 900 -o "$tmp/python.pkg" "$url" >>"$LOG" 2>&1 \
+        || { rm -rf "$tmp"; die "No se pudo descargar Python. Revisa tu conexión a internet e inténtalo de nuevo."; }
+
+    # El instalador debe estar firmado por la Python Software Foundation
+    if ! pkgutil --check-signature "$tmp/python.pkg" 2>>"$LOG" | grep -q "Python Software Foundation"; then
+        rm -rf "$tmp"
+        die "El instalador descargado no tiene la firma oficial de python.org. Se canceló por seguridad y no se instaló nada."
+    fi
+
+    notify "Instalando Python (macOS te pedirá tu contraseña)..."
+    if ! osascript - "$tmp/python.pkg" >>"$LOG" 2>&1 <<'EOF'
+on run argv
+    do shell script "/usr/sbin/installer -pkg " & quoted form of (item 1 of argv) & " -target /" with prompt "Mail Diagnostics necesita tu permiso para instalar Python 3." with administrator privileges
+end run
+EOF
+    then
+        rm -rf "$tmp"
+        die "No se completó la instalación de Python (¿se canceló la contraseña?)."
+    fi
+    rm -rf "$tmp"
+    log "Python instalado."
+}
+
+if [ $NEED_PY -eq 1 ]; then
+    install_python
+    PY="$(find_python)" || die "Python se instaló, pero no se encontró una versión con Tkinter 8.6."
+fi
+
+# ---------------------------------------- Entorno privado y dependencias ----
+if [ $NEED_DEPS -eq 1 ]; then
+    notify "Instalando $DEP_NAME $DEP_VERSION..."
+    log "Creando entorno virtual con $PY"
+    rm -rf "$VENV"
+    "$PY" -m venv "$VENV" >>"$LOG" 2>&1 || die "No se pudo crear el entorno de Python."
+    echo "$PY" >"$VENV/.base_python"
+
+    # --isolated        ignora configuraciones de pip del usuario (p. ej. otro índice de paquetes)
+    # --require-hashes  rechaza cualquier archivo cuya huella no coincida con requirements.txt
+    # --no-deps / --only-binary  instala exactamente el archivo fijado, sin código adicional
+    "$VPY" -I -m pip install --isolated --no-input --disable-pip-version-check \
+        --index-url https://pypi.org/simple --require-hashes --only-binary=:all: --no-deps \
+        -r "$REQS" >>"$LOG" 2>&1
+    if ! deps_ok; then
+        rm -rf "$VENV"
+        die "No se pudo instalar $DEP_NAME (sin conexión, o el archivo no coincidió con su huella de seguridad). No se dejó nada a medias."
+    fi
+    log "Dependencias instaladas y verificadas."
+fi
+
+if [ $FIRST_RUN -eq 1 ]; then
+    echo "$APP_VERSION" >"$STAMP"
+    if [ $NEED_PY -eq 0 ] && [ $NEED_DEPS -eq 0 ]; then
+        notify "Revisión inicial: todos los componentes están instalados."
+    else
+        notify "Todo listo. Abriendo la aplicación..."
+    fi
+fi
+
+# ---------------------------------------------------------------- Lanzar ----
+# Los certificados raíz los lee la propia app de los llaveros del sistema (tls_context).
+rm -f "$SUPPORT/roots.pem"   # archivo que creaban las versiones 2.0 y 2.1; ya no se usa
+export MAILDIAG_REPORTS_DIR="$REPORTS"
+
+log "Abriendo la aplicación"
+rm -f "$LOCK"
+trap - EXIT
+cd "$REPORTS" || true
+# -I: modo aislado (ignora PYTHONPATH y otras variables que podrían inyectar código)
+exec "$VPY" -I "$APP_SCRIPT" "$@" 2>>"$LOG"

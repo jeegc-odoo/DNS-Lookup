@@ -1,0 +1,8 @@
+# Única dependencia externa de Mail Diagnostics.
+# Versión fija y huella SHA-256 del archivo oficial publicado en PyPI:
+#   https://pypi.org/project/dnspython/2.7.0/#files
+# pip se niega a instalar si el archivo descargado no coincide exactamente con esta huella.
+# Instalar con:
+#   python3 -m pip install --require-hashes --only-binary=:all: --no-deps -r requirements.txt
+dnspython==2.7.0 \
+    --hash=sha256:b4c34b7d10b51bcc3a5071e7b8dee77939f1e878477eeecc965e9835f63c6c86
